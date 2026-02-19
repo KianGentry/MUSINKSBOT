@@ -1,0 +1,59 @@
+dataset:
+  csv_path: ./discord.csv
+  output_jsonl: ./data/clean_messages.jsonl
+  stats_json: ./data/preprocess_stats.json
+  style_profile_json: ./data/style_profile.json
+
+target:
+  # Use the Discord AuthorID column value; scientific-notation strings are OK.
+  author_id: "7.27990812679602E+017"
+
+preprocess:
+  min_chars: 5
+  replace_urls: true
+
+embeddings:
+  provider: lm_studio  # sentence_transformers | lm_studio
+  # For LM Studio embeddings, use an embedding model like nomic-embed-text-v1.5
+  # Use the exact model id returned by GET /v1/models.
+  model: text-embedding-nomic-embed-text-v1.5
+  device: cpu
+  batch_size: 128
+
+lm_studio:
+  base_url: http://127.0.0.1:1234
+  embeddings_model: ""   # optional override; leave empty to use embeddings.model
+
+generation:
+  # Chat/completions model id from GET /v1/models
+  model: qwen2.5-7b-instruct
+  temperature: 0.35
+  max_tokens: 180
+  top_p: 0.85
+  stop: []
+  seed: 42
+  retries: 3
+
+discord:
+  # Put secrets in config.yaml (not committed) or set DISCORD_TOKEN env var.
+  token: ""
+  token_env: DISCORD_TOKEN
+  channel_id: 0
+
+  # Behavior
+  spontaneous_interval_minutes: 30
+  engagement_window_minutes: 8
+  reply_probability: 0.15
+  reply_when_mentioned: true
+  ignore_bots: true
+  context_messages: 30
+  retrieval_k: 8
+  cooldown_seconds: 8
+  engagement_threshold: 3.0
+  engagement_max_age_seconds: 900
+
+index:
+  faiss_index_path: ./data/style_index.faiss
+  meta_jsonl_path: ./data/style_index_meta.jsonl
+  build_info_json: ./data/style_index_build_info.json
+
