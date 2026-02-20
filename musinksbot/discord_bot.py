@@ -15,6 +15,7 @@ from discord.ext import tasks
 
 from musinksbot.config import AppConfig
 from musinksbot.embedder import build_embedder
+from musinksbot.gifs import load_tenor_links_from_csv, wants_gif
 from musinksbot.lmstudio_client import LMStudioChatConfig, LMStudioClient
 from musinksbot.prompting import build_prompt, extract_direct_request
 from musinksbot.retrieval import StyleRetriever
@@ -22,6 +23,10 @@ from musinksbot.style_profile import StyleProfile, load_style_profile
 
 
 logger = logging.getLogger(__name__)
+
+
+BOT_AUTHOR = "bot"
+USER_AUTHOR = "user"
 
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -36,7 +41,6 @@ FILLER_WORDS = {
     "uh",
     "um",
     "erm",
-    "idk",
 }
 
 CONTENT_IGNORE_WORDS = {
@@ -120,6 +124,75 @@ POTTY_HUMOUR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Corny/dad-joke style cues. Used to allow mock-aggressive/ironic responses
+# even if they don't share content words with the joke line.
+CORNY_JOKE_RE = re.compile(
+    r"\b("
+    r"the\s+ceiling|"
+    r"dad\s+joke|"
+    r"pun\s*\w*|"
+    r"corny|"
+    r"r/funny|"
+    r"did\s+you\s+get\s+that\s+from"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SMALLTALK_RE = re.compile(
+    r"\b(whats\s+up|what's\s+up|sup|wyd|hows\s+it\s+going|how\s+you\s+doing)\b",
+    re.IGNORECASE,
+)
+
+FOLLOWUP_SMALLTALK_RE = re.compile(
+    r"\b("
+    r"hows\s+(ur|your)\s+day(\s+going)?|"
+    r"how\s+about\s+you|"
+    r"wbu"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SIMPSONS_INSIDE_RE = re.compile(r"\bi\s+seem\s+to\s+i\s+know\s+the\s+simpsons\b", re.IGNORECASE)
+MUSINKS_MEAL_RE = re.compile(r"\bmusinks\s+meal\b", re.IGNORECASE)
+
+QUESTION_START_RE = re.compile(r"^(why|what|how|when|where|who|hows)\b", re.IGNORECASE)
+
+# Stock phrases the model tends to invent that are not in the user's style.
+STOCK_PHRASES_RE = re.compile(
+    r"\b("
+    r"free\s+as\s+a\s+bird"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Model sometimes leaks rewrite/instruction text as an OOC second message.
+META_LEAK_RE = re.compile(
+    r"\b("
+    r"rewritten\s+response|rewrite(d)?\s+response|rewrite:|"
+    r"staying\s+on\s+topic|answering\s+the\s+last\s+message|"
+    r"without\s+parroting|without\s+quoting|in\s+the\s+specified\s+style|"
+    r"ooc|out\s+of\s+character|system\s+prompt|instructions"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MENTION_RE = re.compile(r"<@!?\d+>")
+GREETING_ONLY_RE = re.compile(r"^(h+i+|he+y+|hello+|hiya+|yo+|sup+)$", re.IGNORECASE)
+AT_MUSINKS_RE = re.compile(r"^@?musinks\b\s*", re.IGNORECASE)
+
+VAGUE_ONLY_RE = re.compile(r"^[a-z]{1,2}$", re.IGNORECASE)
+
+# Remove unicode emoji from generated text (prefer reactions instead).
+EMOJI_RE = re.compile(
+    r"["
+    r"\U0001F1E6-\U0001F1FF"  # flags
+    r"\U0001F300-\U0001FAFF"  # symbols & pictographs incl. supplemental
+    r"\U0001F3FB-\U0001F3FF"  # skin tones
+    r"\u2600-\u26FF"          # misc symbols
+    r"\u2700-\u27BF"          # dingbats
+    r"]+"
+)
+
 
 PUNCT_ALWAYS_STRIP_RE = re.compile(r"[!\"\“\”\(\)\[\]\{\};:]")
 
@@ -128,9 +201,78 @@ def _is_potty_humour(text: str) -> bool:
     return bool(POTTY_HUMOUR_RE.search((text or "").lower()))
 
 
+def _is_meta_leak(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if not META_LEAK_RE.search(t):
+        return False
+
+    # If it's short and packed with instruction-y keywords, it's almost certainly a leak.
+    toks = [w.lower() for w in WORD_RE.findall(t)]
+    if len(toks) <= 20:
+        return True
+
+    # Otherwise, only treat it as a leak if it strongly matches common templates.
+    if t.startswith("rewritten response") or t.startswith("rewrite"):
+        return True
+    return False
+
+
+def _is_simpsons_inside_joke(text: str) -> bool:
+    return bool(SIMPSONS_INSIDE_RE.search((text or "").strip()))
+
+
+def _mentions_musinks_meal(text: str) -> bool:
+    return bool(MUSINKS_MEAL_RE.search((text or "").strip()))
+
+
+def _is_corny_joke(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if CORNY_JOKE_RE.search(t):
+        return True
+    # If they're explicitly laughing at their own line, treat it as joke-y.
+    if re.search(r"\b(lol|lmao|haha|hehe)\b", t):
+        # But avoid triggering on generic "lol" acknowledgements.
+        return len(t) <= 80
+    return False
+
+
+def _is_smalltalk(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Strip discord mentions and extra whitespace/punct.
+    t2 = MENTION_RE.sub(" ", t)
+    t2 = re.sub(r"[^a-z\s']+", " ", t2)
+    t2 = re.sub(r"\s+", " ", t2).strip()
+    if not t2:
+        return False
+    if GREETING_ONLY_RE.fullmatch(t2):
+        return True
+    return bool(SMALLTALK_RE.search(t2))
+
+
+def _is_vague(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    t2 = MENTION_RE.sub(" ", t)
+    t2 = re.sub(r"[^a-z\s']+", " ", t2)
+    t2 = re.sub(r"\s+", " ", t2).strip()
+    if not t2:
+        return False
+    if t2 in {"ok", "k", "kk"}:
+        return False
+    # Single letters / tiny fragments like "p".
+    return bool(VAGUE_ONLY_RE.fullmatch(t2))
+
+
 def _last_user_text(recent: list[tuple[str, str]]) -> str:
     for author, content in reversed(recent):
-        if author.strip().lower() == "musinks":
+        if author.strip().lower() == BOT_AUTHOR:
             continue
         c = (content or "").strip()
         if c:
@@ -154,7 +296,7 @@ def _pick_funny_reaction(guild: discord.Guild | None) -> str | discord.Emoji:
         if e is not None:
             return e
     # Fallback to a common equivalent.
-    return "😭"
+    return "sob"
 
 
 def _parse_discord_id(raw: str) -> int:
@@ -250,11 +392,24 @@ def postprocess_bot_text(
     if not t:
         return ""
     # Remove a couple of common wrappers.
-    for prefix in ("assistant:", "musinks:"):
+    for prefix in ("assistant:", "musinks:", "bot:"):
         if t.lower().startswith(prefix):
             t = t[len(prefix) :].strip()
+
+    # Don't echo mentions / the bot's name.
+    t = MENTION_RE.sub(" ", t)
+    t = AT_MUSINKS_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Avoid overly-cheery greeting openers.
+    t = re.sub(r"^(hey|hi|hello)\s+there\b\s*", "", t, flags=re.IGNORECASE)
     # Enforce lowercase (user requirement) while keeping urls intact.
     t = _lowercase_preserving_urls(t)
+
+    # Strip emojis and joiners/variation selectors to avoid random emoji spam.
+    t = EMOJI_RE.sub("", t)
+    t = t.replace("\u200d", "").replace("\ufe0f", "")
+    t = re.sub(r"\s{2,}", " ", t).strip()
     # Guardrail: avoid out-of-corpus token that the model tends to overuse.
     t = re.sub(r"\bwot\b", "what", t)
     # Align to user's shorthand (based on corpus).
@@ -280,7 +435,7 @@ def postprocess_bot_text(
     # Avoid leaning on "meme" as a filler word.
     t = re.sub(r"\bmemes?\b", "joke", t)
 
-    funny = _is_potty_humour(last_user_text)
+    funny = _is_potty_humour(last_user_text) or _is_corny_joke(last_user_text) or _is_smalltalk(last_user_text)
     # Strongly suppress lol/lmao in general.
     if funny:
         # If laughing, prefer a single lmaooo (rare).
@@ -298,14 +453,12 @@ def postprocess_bot_text(
     # Drop standalone signature lines the model sometimes emits.
     lines = [ln.strip() for ln in t.split("\n")]
     lines = [ln for ln in lines if ln and ln not in {"musinks", "musinks app"}]
+    lines = [ln for ln in lines if not _is_meta_leak(ln)]
     t = "\n".join(lines).strip()
 
-    if max_chars is not None and max_chars > 0 and len(t) > int(max_chars):
-        cut = t[: int(max_chars)].rstrip()
-        # Avoid cutting mid-word.
-        if " " in cut:
-            cut = cut.rsplit(" ", 1)[0].rstrip()
-        t = cut
+    # Avoid postprocess truncation. Length should be controlled via the model's
+    # token limits. Discord hard-limits messages to 2000 chars (send will fail
+    # if exceeded), but in normal operation the token limit keeps this safe.
     return t.strip()
 
 
@@ -326,12 +479,49 @@ def relevance_issues(*, reply: str, last_user_text: str) -> list[str]:
         # Allow short clarification questions.
         if _looks_like_question(r):
             return []
+        # Allow corny-joke responses that are mock-aggressive / ironic.
+        if _is_corny_joke(u):
+            return []
         if len(user_cw & reply_cw) == 0:
             return ["low_relevance"]
 
     # Avoid spitting out links/gifs unless the user already posted a link.
     if URL_RE.search(r) and not URL_RE.search(u):
         return ["unsolicited_link"]
+
+    return []
+
+
+def echo_issues(*, reply: str, last_user_text: str) -> list[str]:
+    """Detect when the reply is mostly an echo of the user's last message."""
+    r = (reply or "").strip().lower()
+    u = (last_user_text or "").strip().lower()
+    if not r or not u:
+        return []
+
+    # Strip discord mentions for comparison.
+    r2 = MENTION_RE.sub(" ", r)
+    u2 = MENTION_RE.sub(" ", u)
+    r2 = re.sub(r"\s+", " ", r2).strip()
+    u2 = re.sub(r"\s+", " ", u2).strip()
+    if not r2 or not u2:
+        return []
+
+    # High overall similarity (exact/near paraphrase).
+    if _similarity(r2, u2) >= 0.86:
+        return ["echo_similarity"]
+
+    # If reply contains a long chunk of the user's words.
+    uw = [w.lower() for w in WORD_RE.findall(u2)]
+    rw = [w.lower() for w in WORD_RE.findall(r2)]
+    if len(uw) >= 4 and len(rw) >= 4:
+        for n in (5, 4):
+            u_ngrams = set(_ngrams(uw, n))
+            if not u_ngrams:
+                continue
+            for ng in _ngrams(rw, n):
+                if ng in u_ngrams:
+                    return ["echo_phrase"]
 
     return []
 
@@ -350,7 +540,16 @@ def _split_for_sending(raw_text: str, *, max_parts: int = 2) -> list[str]:
     # If it looks like one sentence, keep it as one.
     if len(parts) == 1:
         return parts
-    return parts[: max(1, int(max_parts))]
+
+    # Keep at most max_parts, but don't silently drop content: merge overflow
+    # into the final part.
+    n = max(1, int(max_parts))
+    if len(parts) <= n:
+        return parts
+    head = parts[: n - 1] if n > 1 else []
+    tail = " ".join(parts[n - 1 :]).strip()
+    merged = head + ([tail] if tail else [])
+    return merged if merged else [parts[0]]
 
 
 def _words(s: str) -> list[str]:
@@ -363,6 +562,76 @@ def _looks_like_question(text: str) -> bool:
         return False
     # Punctuation is often stripped; treat question-words as a question signal.
     return bool(QUESTION_WORD_RE.search(t))
+
+
+def _is_question_part(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return bool(QUESTION_START_RE.search(t))
+
+
+def _drop_appended_followups(*, parts: list[str], last_user_text: str) -> list[str]:
+    """If user asked a question, don't append a new smalltalk question."""
+    if not parts:
+        return parts
+    if not _looks_like_question(last_user_text):
+        return parts
+
+    kept: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        if _is_question_part(p) and FOLLOWUP_SMALLTALK_RE.search(p):
+            continue
+        kept.append(p)
+
+    # If we removed everything (rare), fall back to original first part.
+    return kept if kept else [parts[0]]
+
+
+def _normalize_for_repeat_compare(text: str) -> str:
+    t = (text or "").strip().lower()
+    if not t:
+        return ""
+    t = MENTION_RE.sub(" ", t)
+    t = AT_MUSINKS_RE.sub("", t)
+    # Common chat normalizations.
+    t = re.sub(r"\bur\b", "your", t)
+    t = re.sub(r"\bu\b", "you", t)
+    t = re.sub(r"\bim\b", "i am", t)
+    t = re.sub(r"\bdont\b", "do not", t)
+    t = re.sub(r"\bcant\b", "can not", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _is_part_repeated(part: str, recent_bot_texts: list[str]) -> bool:
+    p = _normalize_for_repeat_compare(part)
+    if not p:
+        return False
+    for prev in recent_bot_texts[-25:]:
+        pv = _normalize_for_repeat_compare(prev)
+        if not pv:
+            continue
+        if p == pv:
+            return True
+        # Stricter for short lines.
+        thr = 0.86 if len(p) <= 80 else 0.90
+        if _similarity(p, pv) >= thr:
+            return True
+    return False
+
+
+def _drop_repeated_parts(*, parts: list[str], recent_bot_texts: list[str]) -> list[str]:
+    if len(parts) <= 1:
+        return parts
+    kept = [p for p in parts if p and not _is_part_repeated(p, recent_bot_texts)]
+    return kept if kept else [parts[0]]
+
+
+def _drop_meta_parts(*, parts: list[str]) -> list[str]:
+    return [p for p in parts if p and not _is_meta_leak(p)]
 
 
 def _similarity(a: str, b: str) -> float:
@@ -468,6 +737,27 @@ def nonsense_issues(*, reply: str) -> list[str]:
     if not toks:
         return ["no_words"]
 
+    # Repeated lines often indicate looping.
+    if "\n" in (reply or ""):
+        lines = [ln.strip().lower() for ln in (reply or "").split("\n") if ln.strip()]
+        if len(lines) >= 2 and len(set(lines)) < len(lines):
+            return ["repeat_line"]
+
+    # Repeated short phrase inside a single reply.
+    if len(toks) >= 10:
+        for n in (4, 3):
+            ngs = _ngrams(toks, n)
+            if not ngs:
+                continue
+            seen: set[tuple[str, ...]] = set()
+            for ng in ngs:
+                # ignore ngrams that are all stopwords
+                if all(w in CONTENT_IGNORE_WORDS for w in ng):
+                    continue
+                if ng in seen:
+                    return [f"repeat_{n}gram"]
+                seen.add(ng)
+
     # e.g. "mate mate mate" / "idk idk idk"
     for i in range(len(toks) - 2):
         if toks[i] == toks[i + 1] == toks[i + 2]:
@@ -485,6 +775,15 @@ def nonsense_issues(*, reply: str) -> list[str]:
         if filler / len(toks) >= 0.34:
             return ["filler_heavy"]
 
+    return []
+
+
+def stock_phrase_issues(*, reply: str) -> list[str]:
+    t = (reply or "").strip().lower()
+    if not t:
+        return []
+    if STOCK_PHRASES_RE.search(t):
+        return ["stock_phrase"]
     return []
 
 
@@ -761,6 +1060,20 @@ class MusinksDiscordClient(discord.Client):
         self.state = EngagementState()
         self.target_author_id = _parse_discord_id(cfg.target.author_id)
 
+        # Tenor GIF pool (cached on disk). This is extracted from the original
+        # CSV export because the cleaned JSONL typically has URLs replaced.
+        self.tenor_links: list[str] = []
+        try:
+            self.tenor_links = load_tenor_links_from_csv(
+                csv_path=cfg.dataset.csv_path,
+                target_author_id=int(self.target_author_id),
+                cache_path=Path("data/tenor_links.json"),
+            )
+            if self.tenor_links:
+                logger.info("Loaded %d Tenor links", len(self.tenor_links))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to load Tenor links: %s", e)
+
         self.live_style_tail: deque[str] = deque(maxlen=250)
         self.live_style_path = Path("data/live_style_tail.jsonl")
         try:
@@ -840,9 +1153,10 @@ class MusinksDiscordClient(discord.Client):
                 # Include our own messages so the model can follow its own questions.
                 if self.user is None or msg.author.id != self.user.id:
                     continue
-                author = "musinks"
+                author = BOT_AUTHOR
             else:
-                author = msg.author.display_name
+                # Use a fixed label to avoid confusion when a human shares the bot name.
+                author = USER_AUTHOR
             content = (msg.content or "").strip()
             if not content:
                 continue
@@ -852,6 +1166,20 @@ class MusinksDiscordClient(discord.Client):
 
     async def _generate_text(self, *, recent: list[tuple[str, str]], spontaneous: bool) -> str:
         last_user_text = _last_user_text(recent)
+
+        # Explicit gif request -> send a random Tenor link from the dataset.
+        if (not spontaneous) and wants_gif(last_user_text):
+            if self.tenor_links:
+                return random.choice(self.tenor_links)
+            return postprocess_bot_text("no gifs in my dataset", last_user_text=last_user_text)
+
+        # Vague junk -> quick clarifier (prevents the model inventing a scenario).
+        if (not spontaneous) and _is_vague(last_user_text):
+            return postprocess_bot_text("what", last_user_text=last_user_text)
+
+        # Smalltalk -> joke response (keeps the bot from starting serious convos).
+        if (not spontaneous) and _is_smalltalk(last_user_text):
+            return postprocess_bot_text("the ceiling lol", last_user_text=last_user_text)
         # Retrieve examples based on style markers rather than conversation semantics.
         # This reduces topic bleed (examples are for wording/tone, not content).
         if self.style_profile is not None and self.style_profile.markers:
@@ -894,29 +1222,23 @@ class MusinksDiscordClient(discord.Client):
 
         raw_text = self.llm.generate_response(system=prompt.system, user=prompt.user)
 
-        # Enforce shorter replies based on observed style distribution.
-        if spontaneous:
-            max_chars = 140
-        elif self.style_profile is not None:
-            max_chars = max(35, int(self.style_profile.p50_chars) + 25)
-        else:
-            max_chars = 70
-
         # Split into up to 2 short messages if the model produced multiple sentences.
         parts_raw = _split_for_sending(raw_text, max_parts=2)
+        # Collect recent bot messages for repetition checks.
+        recent_bot_texts = [c for a, c in recent[-25:] if a == BOT_AUTHOR]
         if len(parts_raw) <= 1:
-            text = postprocess_bot_text(raw_text, last_user_text=last_user_text, max_chars=max_chars)
+            text = postprocess_bot_text(raw_text, last_user_text=last_user_text)
         else:
             # Process each part as a single short message.
             processed = [
-                postprocess_bot_text(p, last_user_text=last_user_text, max_chars=max_chars)
+                postprocess_bot_text(p, last_user_text=last_user_text)
                 for p in parts_raw
             ]
             processed = [p for p in processed if p]
+            processed = _drop_meta_parts(parts=processed)
+            processed = _drop_appended_followups(parts=processed, last_user_text=last_user_text)
+            processed = _drop_repeated_parts(parts=processed, recent_bot_texts=recent_bot_texts)
             text = "\n".join(processed[:2])
-
-        # Collect recent bot messages for repetition checks.
-        recent_bot_texts = [c for a, c in recent[-20:] if a == "musinks"]
 
         # Guardrail: if the model drifts into random topics, force a single rewrite
         # that stays grounded in the chat context.
@@ -935,7 +1257,7 @@ class MusinksDiscordClient(discord.Client):
                 repetition_issues(
                     reply=p,
                     recent_bot_texts=recent_bot_texts,
-                    threshold=0.84 if len(p) <= 60 else 0.88,
+                    threshold=0.82 if len(p) <= 80 else 0.88,
                 )
             )
         # de-dupe while preserving order
@@ -958,7 +1280,19 @@ class MusinksDiscordClient(discord.Client):
             relevance_hits.extend(relevance_issues(reply=p, last_user_text=last_user_text))
         relevance_hits = list(dict.fromkeys([h for h in relevance_hits if h]))
 
-        if bad_words or rep_hits or nonsense_hits or relevance_hits or phrase_hits:
+        echo_hits: list[str] = []
+        echo_hits.extend(echo_issues(reply=text, last_user_text=last_user_text))
+        for p in parts_for_checks:
+            echo_hits.extend(echo_issues(reply=p, last_user_text=last_user_text))
+        echo_hits = list(dict.fromkeys([h for h in echo_hits if h]))
+
+        stock_hits: list[str] = []
+        stock_hits.extend(stock_phrase_issues(reply=text))
+        for p in parts_for_checks:
+            stock_hits.extend(stock_phrase_issues(reply=p))
+        stock_hits = list(dict.fromkeys([h for h in stock_hits if h]))
+
+        if bad_words or rep_hits or nonsense_hits or relevance_hits or phrase_hits or echo_hits or stock_hits:
             problems: list[str] = []
             if bad_words:
                 problems.append("unrelated topic words: " + ", ".join(bad_words[:12]))
@@ -970,6 +1304,10 @@ class MusinksDiscordClient(discord.Client):
                 problems.append("nonsensical/looping output")
             if relevance_hits:
                 problems.append("not answering the last user message")
+            if echo_hits:
+                problems.append("echoing the users message")
+            if stock_hits:
+                problems.append("using stock phrases that are not in style")
 
             rewrite_user = (
                 prompt.user
@@ -980,24 +1318,38 @@ class MusinksDiscordClient(discord.Client):
                 + "- answer the users last message directly\n"
                 + "- do not repeat the same phrasing as earlier bot messages\n"
                 + ("- avoid these exact phrases: " + ", ".join(phrase_hits[:8]) + "\n" if phrase_hits else "")
+                + "- do not quote or repeat the users words (no parroting)\n"
                 + "- if you listed unrelated topic words above, do not mention them\n"
                 + "- do not say eh (unless the user said it first)\n"
+                + "- do not use stock phrases like 'free as a bird'\n"
                 + "- keep it short and all lowercase\n"
                 + "- it must be coherent and make sense\n"
             )
             raw2 = self.llm.generate_response(system=prompt.system, user=rewrite_user)
             parts2 = _split_for_sending(raw2, max_parts=2)
             if len(parts2) <= 1:
-                text2 = postprocess_bot_text(raw2, last_user_text=last_user_text, max_chars=max_chars)
+                text2 = postprocess_bot_text(raw2, last_user_text=last_user_text)
             else:
                 processed2 = [
-                    postprocess_bot_text(p, last_user_text=last_user_text, max_chars=max_chars)
+                    postprocess_bot_text(p, last_user_text=last_user_text)
                     for p in parts2
                 ]
                 processed2 = [p for p in processed2 if p]
+                processed2 = _drop_meta_parts(parts=processed2)
+                processed2 = _drop_appended_followups(parts=processed2, last_user_text=last_user_text)
+                processed2 = _drop_repeated_parts(parts=processed2, recent_bot_texts=recent_bot_texts)
                 text2 = "\n".join(processed2[:2])
             if text2:
-                return text2
+                # Re-check the rewritten text; if still looping/stocky, break the loop.
+                parts2_for_checks = [p.strip() for p in text2.split("\n") if p.strip()]
+                still_bad = False
+                for p in parts2_for_checks:
+                    if stock_phrase_issues(reply=p) or nonsense_issues(reply=p):
+                        still_bad = True
+                        break
+                if not still_bad:
+                    return text2
+                return postprocess_bot_text("what do you mean", last_user_text=last_user_text)
 
         return text
 
@@ -1009,6 +1361,7 @@ class MusinksDiscordClient(discord.Client):
         reply_to: discord.Message | None = None,
     ) -> discord.Message | None:
         parts = [p.strip() for p in (parts_text or "").split("\n") if p.strip()]
+        parts = [p for p in parts if not _is_meta_leak(p)]
         if not parts:
             return None
         if len(parts) == 1:
@@ -1104,6 +1457,31 @@ class MusinksDiscordClient(discord.Client):
                     await message.add_reaction(_pick_funny_reaction(message.guild))
         except Exception:
             # Missing perms / unknown emoji etc - ignore.
+            pass
+
+        # Inside joke: "i seem to i know the simpsons" -> icant react or "the destiny of marge".
+        try:
+            content = (message.content or "").strip()
+            if content and _is_simpsons_inside_joke(content):
+                try:
+                    await message.add_reaction(_pick_funny_reaction(message.guild))
+                except Exception:
+                    pass
+                # Reply sometimes, but don't spam.
+                if self._cooldown_ok() and random.random() < 0.55:
+                    await message.reply("the destiny of marge", mention_author=False)
+                    self.state.last_reply_monotonic = time.monotonic()
+        except Exception:
+            pass
+
+        # Inside joke: musinks meal.
+        try:
+            content = (message.content or "").strip()
+            if content and _mentions_musinks_meal(content):
+                if self._cooldown_ok() and random.random() < 0.45:
+                    await message.reply("musinks meal is that chicken burger meal that made me throw up", mention_author=False)
+                    self.state.last_reply_monotonic = time.monotonic()
+        except Exception:
             pass
 
         # Lightweight local "training": keep a tail of the target author's short lines.

@@ -141,7 +141,7 @@ def preprocess_csv(
     stats_json: str | Path,
     target_author_id: str,
     min_chars: int = 5,
-    replace_urls: bool = True,
+    replace_urls: bool = False,
     log_every: int = 50_000,
 ) -> PreprocessStats:
     csv_path = Path(csv_path)

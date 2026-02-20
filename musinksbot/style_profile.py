@@ -29,7 +29,7 @@ DEFAULT_MARKERS = [
 @dataclass(frozen=True)
 class StyleProfile:
     messages: int
-    avg_chars: float
+    avg_chars: int
     p50_chars: float
     p90_chars: float
     markers: list[str]
